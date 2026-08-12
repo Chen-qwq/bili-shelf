@@ -1,7 +1,8 @@
 const DB_NAME = 'bili-fav-sorter-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const LEGACY_DB_NAME = 'bili-fav-sorter-cache';
 const CACHE_PS = 20;
+const TRASH_DISPLAY_LIMIT = 50;
 
 const state = {
   user: null,
@@ -17,7 +18,12 @@ const state = {
   currentHighlightBvid: '',
   selectedIndex: -1,
   sortedCache: [],
-  keyboardBusy: false
+  randomSortedItems: null,
+  randomSortedSignature: '',
+  keyboardBusy: false,
+  syncing: false,
+  syncCancelled: false,
+  syncResumeAvailable: false
 };
 
 const criteria = [
@@ -36,8 +42,9 @@ const DEFAULT_SETTINGS = {
   selectedFolderId: '',
   sort1: 'fav_time', sort2: 'view', sort3: 'duration',
   dir1: 'desc', dir2: 'desc', dir3: 'desc',
+  randomSort: false,
   shortcutScope: 'selected', shortcutKey: 'u',
-  previewEnabled: true, previewMuted: true, previewRequireAlt: true, previewHoverDelay: 2000, previewRate: 4,
+  previewEnabled: true, previewMuted: true, previewRequireAlt: true, previewHoverDelay: 2000, previewRate: 4, previewVolume: 70,
   preserveVideoRate: true, focusPageAfterOpen: false, preservePlayerMode: true, theaterLayout: false,
   sideKeyboardEnabled: true,
   renderBatchSize: 80
@@ -48,9 +55,10 @@ const els = {
   userStatus: $('#userStatus'), refreshBtn: $('#refreshBtn'), folderSelect: $('#folderSelect'),
   openCacheBtn: $('#openCacheBtn'), syncBtn: $('#syncBtn'), clearCacheBtn: $('#clearCacheBtn'),
   progressBox: $('#progressBox'), progressText: $('#progressText'), progressPercent: $('#progressPercent'), progressBar: $('#progressBar'),
-  sort1: $('#sort1'), sort2: $('#sort2'), sort3: $('#sort3'), dir1: $('#dir1'), dir2: $('#dir2'), dir3: $('#dir3'), keyword: $('#keyword'),
-  shortcutScope: $('#shortcutScope'), shortcutKey: $('#shortcutKey'), previewEnabled: $('#previewEnabled'), previewSound: $('#previewSound'), previewRequireAlt: $('#previewRequireAlt'), previewHoverDelay: $('#previewHoverDelay'), previewRate: $('#previewRate'), preserveVideoRate: $('#preserveVideoRate'), focusPageAfterOpen: $('#focusPageAfterOpen'), preservePlayerMode: $('#preservePlayerMode'), theaterLayout: $('#theaterLayout'), sideKeyboardEnabled: $('#sideKeyboardEnabled'), renderBatchSize: $('#renderBatchSize'),
+  sort1: $('#sort1'), sort2: $('#sort2'), sort3: $('#sort3'), dir1: $('#dir1'), dir2: $('#dir2'), dir3: $('#dir3'), keyword: $('#keyword'), sortFields: $('#sortFields'), randomSort: $('#randomSort'), randomReshuffleBtn: $('#randomReshuffleBtn'),
+  shortcutScope: $('#shortcutScope'), shortcutKey: $('#shortcutKey'), previewEnabled: $('#previewEnabled'), previewSound: $('#previewSound'), previewRequireAlt: $('#previewRequireAlt'), previewHoverDelay: $('#previewHoverDelay'), previewRate: $('#previewRate'), previewVolume: $('#previewVolume'), preserveVideoRate: $('#preserveVideoRate'), focusPageAfterOpen: $('#focusPageAfterOpen'), preservePlayerMode: $('#preservePlayerMode'), theaterLayout: $('#theaterLayout'), sideKeyboardEnabled: $('#sideKeyboardEnabled'), renderBatchSize: $('#renderBatchSize'),
   exportJsonBtn: $('#exportJsonBtn'), exportCsvBtn: $('#exportCsvBtn'), refreshTrashBtn: $('#refreshTrashBtn'), clearTrashBtn: $('#clearTrashBtn'), trashList: $('#trashList'),
+  trashPanel: $('#trashPanel'),
   message: $('#message'), list: $('#list'), loadMoreBtn: $('#loadMoreBtn'), scrollTopBtn: $('#scrollTopBtn'), gotoCurrentBtn: $('#gotoCurrentBtn'), tpl: $('#itemTpl')
 };
 
@@ -76,6 +84,9 @@ function openDb() {
       if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'key' });
       if (!db.objectStoreNames.contains('items')) db.createObjectStore('items', { keyPath: 'mediaId' });
       if (!db.objectStoreNames.contains('trash')) db.createObjectStore('trash', { keyPath: 'trashId' });
+      const trash = req.transaction.objectStore('trash');
+      if (!trash.indexNames.contains('deletedAt')) trash.createIndex('deletedAt', 'deletedAt', { unique: false });
+      if (!trash.indexNames.contains('aidFolder')) trash.createIndex('aidFolder', ['aid', 'folderId'], { unique: false });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -100,6 +111,37 @@ const dbPut = (store, value) => idb(store, 'readwrite', s => s.put(value));
 const dbDelete = (store, key) => idb(store, 'readwrite', s => s.delete(key));
 const dbClear = store => idb(store, 'readwrite', s => s.clear());
 const dbAll = store => idb(store, 'readonly', s => s.getAll());
+
+function dbRecentTrash(limit = TRASH_DISPLAY_LIMIT) {
+  return openDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction('trash', 'readonly');
+    const index = tx.objectStore('trash').index('deletedAt');
+    const records = [];
+    const request = index.openCursor(null, 'prev');
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor || records.length >= limit) return;
+      records.push(cursor.value);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => resolve(records);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
+
+function dbTrashByAidFolder(aid, folderId) {
+  return openDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction('trash', 'readonly');
+    const index = tx.objectStore('trash').index('aidFolder');
+    const request = index.getAll(IDBKeyRange.only([Number(aid), String(folderId)]));
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
 
 
 function openLegacyDb() {
@@ -181,8 +223,21 @@ function fillCriteria() {
   });
 }
 
+function updateSortControls() {
+  const random = els.randomSort?.checked === true;
+  els.sortFields?.classList.toggle('hidden', random);
+  els.randomReshuffleBtn?.classList.toggle('hidden', !random);
+}
+
 async function loadSettings() {
-  const s = { ...DEFAULT_SETTINGS, ...(await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS))) };
+  const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
+  const legacyRandom = [stored.sort1, stored.sort2, stored.sort3].includes('random');
+  const s = { ...DEFAULT_SETTINGS, ...stored, randomSort: stored.randomSort === true || legacyRandom };
+  if (legacyRandom) {
+    s.sort1 = DEFAULT_SETTINGS.sort1;
+    s.sort2 = DEFAULT_SETTINGS.sort2;
+    s.sort3 = DEFAULT_SETTINGS.sort3;
+  }
   for (const id of ['sort1', 'sort2', 'sort3', 'dir1', 'dir2', 'dir3', 'shortcutScope']) els[id].value = s[id];
   els.shortcutKey.value = String(s.shortcutKey || 'u').slice(0, 1).toLowerCase();
   els.previewEnabled.checked = s.previewEnabled !== false;
@@ -191,11 +246,15 @@ async function loadSettings() {
   const hoverDelay = Number(s.previewHoverDelay ?? 2000);
   els.previewHoverDelay.value = hoverDelay <= 900 ? 2000 : hoverDelay;
   els.previewRate.value = Number(s.previewRate ?? 4);
+  const storedPreviewVolume = Number(s.previewVolume ?? 70);
+  if (els.previewVolume) els.previewVolume.value = Number.isFinite(storedPreviewVolume) ? Math.max(0, Math.min(100, storedPreviewVolume)) : 70;
   if (els.preserveVideoRate) els.preserveVideoRate.checked = s.preserveVideoRate !== false;
   if (els.focusPageAfterOpen) els.focusPageAfterOpen.checked = s.focusPageAfterOpen !== false;
   if (els.preservePlayerMode) els.preservePlayerMode.checked = s.preservePlayerMode !== false;
   if (els.theaterLayout) els.theaterLayout.checked = s.theaterLayout === true;
   if (els.sideKeyboardEnabled) els.sideKeyboardEnabled.checked = s.sideKeyboardEnabled !== false;
+  if (els.randomSort) els.randomSort.checked = s.randomSort === true;
+  updateSortControls();
   els.renderBatchSize.value = Math.max(20, Math.min(500, Number(s.renderBatchSize ?? 80)));
   state.renderLimit = Math.max(20, Math.min(500, Number(els.renderBatchSize.value || 80)));
   state.selectedFolderId = s.selectedFolderId || '';
@@ -205,11 +264,14 @@ async function saveSettings() {
   const shortcutKey = (els.shortcutKey.value || 'u').slice(0, 1).toLowerCase();
   const previewHoverDelay = Math.max(1200, Number(els.previewHoverDelay.value || 2000));
   const previewRate = Math.max(0.25, Math.min(16, Number(els.previewRate.value || 4)));
+  const enteredPreviewVolume = Number(els.previewVolume?.value ?? 70);
+  const previewVolume = Number.isFinite(enteredPreviewVolume) ? Math.max(0, Math.min(100, enteredPreviewVolume)) : 70;
   const renderBatchSize = Math.max(20, Math.min(500, Number(els.renderBatchSize.value || 80)));
   await chrome.storage.local.set({
     selectedFolderId: els.folderSelect.value || state.selectedFolderId || '',
     sort1: els.sort1.value, sort2: els.sort2.value, sort3: els.sort3.value,
     dir1: els.dir1.value, dir2: els.dir2.value, dir3: els.dir3.value,
+    randomSort: els.randomSort?.checked === true,
     shortcutScope: els.shortcutScope.value,
     shortcutKey,
     previewEnabled: els.previewEnabled.checked,
@@ -217,6 +279,7 @@ async function saveSettings() {
     previewRequireAlt: els.previewRequireAlt.checked,
     previewHoverDelay,
     previewRate,
+    previewVolume,
     preserveVideoRate: els.preserveVideoRate ? els.preserveVideoRate.checked : true,
     focusPageAfterOpen: els.focusPageAfterOpen ? els.focusPageAfterOpen.checked : true,
     preservePlayerMode: els.preservePlayerMode ? els.preservePlayerMode.checked : true,
@@ -283,17 +346,21 @@ async function openCacheForCurrentFolder() {
   if (!cache) {
     state.items = [];
     state.info = null;
+    state.syncResumeAvailable = false;
+    if (!state.syncing) els.syncBtn.textContent = '慢速同步';
     render();
     return msg('当前收藏夹还没有缓存，请先慢速同步。');
   }
   state.items = (cache.items || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id);
   state.info = cache.info || null;
   state.selectedFolderId = mediaId;
+  state.syncResumeAvailable = Boolean(cache.partial && cache.syncState && Number(cache.syncState.nextPage) > 1);
+  if (!state.syncing) els.syncBtn.textContent = state.syncResumeAvailable ? '继续同步' : '慢速同步';
   await saveSettings();
   resetRenderLimit();
   render();
   const time = cache.updatedAt ? new Date(cache.updatedAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间';
-  msg(`已打开缓存：${state.items.length} 个视频，更新于 ${time}${cache.partial ? '（部分缓存）' : ''}`);
+  msg(`已打开缓存：${state.items.length} 个视频，更新于 ${time}${cache.partial ? '（部分缓存，可继续同步）' : ''}`);
 }
 
 function setProgress(done, total, text, isError = false) {
@@ -305,13 +372,14 @@ function setProgress(done, total, text, isError = false) {
   els.progressBar.classList.toggle('error', Boolean(isError));
 }
 
-async function saveItemsCache(mediaId, items, info, partial = false) {
+async function saveItemsCache(mediaId, items, info, partial = false, syncState = null) {
   await dbPut('items', {
     mediaId: String(mediaId),
     folderTitle: folderTitleById(mediaId),
     info: info || null,
     items: items || [],
     partial,
+    syncState: partial ? syncState : null,
     updatedAt: Date.now()
   });
 }
@@ -319,8 +387,17 @@ async function saveItemsCache(mediaId, items, info, partial = false) {
 async function slowSync() {
   const mediaId = currentFolderId();
   if (!mediaId) return msg('请先选择收藏夹。');
+  if (state.syncing) {
+    state.syncCancelled = true;
+    msg('正在结束当前同步，已完成的分页会保留。');
+    return;
+  }
   await saveSettings();
-  els.syncBtn.disabled = true;
+  state.syncing = true;
+  state.syncCancelled = false;
+  state.syncResumeAvailable = false;
+  els.syncBtn.disabled = false;
+  els.syncBtn.textContent = '中断同步';
   els.progressBar.classList.remove('error');
   msg('开始慢速同步，期间不要连续点刷新。');
   const oldCache = await dbGet('items', mediaId);
@@ -331,14 +408,23 @@ async function slowSync() {
     render();
   }
 
-  const items = [];
-  let info = null;
-  let total = 0;
-  let pages = 1;
+  const savedSync = oldCache?.partial && oldCache.syncState && Number(oldCache.syncState.nextPage) > 1
+    ? oldCache.syncState
+    : null;
+  const items = savedSync ? [...(oldCache.items || [])] : [];
+  let info = savedSync ? (oldCache.info || null) : null;
+  let total = Number(savedSync?.total || info?.media_count || 0);
+  let pages = Number(savedSync?.pages || (total ? Math.ceil(total / CACHE_PS) : 0));
+  let nextPage = Math.max(1, Number(savedSync?.nextPage || 1));
+  let checkpointItems = [...items];
+  let checkpointNextPage = nextPage;
   let partial = false;
+  let completed = false;
+  if (savedSync) msg(`从第 ${nextPage} 页继续同步，已保留 ${items.length} 个视频。`);
   try {
-    for (let pn = 1; pn <= pages; pn++) {
-      setProgress(items.length, total || 1, `正在请求第 ${pn} 页 / ${pages} 页`);
+    for (let pn = nextPage; pages === 0 || pn <= pages; pn++) {
+      if (state.syncCancelled) throw new Error('用户中断同步');
+      setProgress(items.length, total || 1, `正在请求第 ${pn} 页${pages ? ` / ${pages} 页` : ''}`);
       const data = await send('GET_ITEMS_PAGE', { mediaId, pn, ps: CACHE_PS, order: 'mtime' });
       if (!info) {
         info = data.info || null;
@@ -347,32 +433,58 @@ async function slowSync() {
       }
       const medias = (data.medias || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id);
       items.push(...medias);
+      nextPage = pn + 1;
       state.items = items;
       state.info = info;
+      await saveItemsCache(mediaId, items, info, true, {
+        nextPage,
+        total,
+        pages,
+        order: 'mtime',
+        ps: CACHE_PS
+      });
+      checkpointItems = [...items];
+      checkpointNextPage = nextPage;
       render();
       setProgress(items.length, total || items.length, `已同步 ${items.length} / ${total || items.length}，第 ${pn} / ${pages} 页`);
-      if (pn >= pages || (data.medias || []).length < CACHE_PS) break;
+      if (state.syncCancelled) throw new Error('用户中断同步');
+      if ((pages && pn >= pages) || (data.medias || []).length < CACHE_PS) {
+        completed = true;
+        break;
+      }
       const wait = jitter(1600, 3200);
       setProgress(items.length, total || items.length, `等待 ${Math.round(wait / 1000)} 秒后继续，避免 412`);
       await sleep(wait);
     }
   } catch (e) {
-    partial = true;
-    if (items.length) {
-      await saveItemsCache(mediaId, items, info, true);
-      state.items = items;
+    partial = !completed;
+    if (checkpointItems.length) {
+      await saveItemsCache(mediaId, checkpointItems, info, true, {
+        nextPage: checkpointNextPage,
+        total,
+        pages,
+        order: 'mtime',
+        ps: CACHE_PS
+      });
+      state.items = checkpointItems;
       state.info = info;
+      state.syncResumeAvailable = true;
       render();
-      setProgress(items.length, total || items.length, `同步中断，已保存部分缓存 ${items.length} 个：${e.message}`, true);
-      msg(e.message || String(e));
+      const cancelled = state.syncCancelled || e.message === '用户中断同步';
+      setProgress(checkpointItems.length, total || checkpointItems.length, `同步中断，已保存 ${checkpointItems.length} 个，可继续第 ${checkpointNextPage} 页`, cancelled ? false : true);
+      msg(cancelled ? '同步已中断，已保存进度；再次点击“慢速同步”即可继续。' : (e.message || String(e)));
     } else {
       setProgress(0, 1, `同步失败：${e.message}`, true);
       msg(e.message || String(e));
     }
     return;
   } finally {
+    state.syncing = false;
+    state.syncCancelled = false;
     els.syncBtn.disabled = false;
+    els.syncBtn.textContent = state.syncResumeAvailable ? '继续同步' : '慢速同步';
   }
+  if (partial) return;
   await saveItemsCache(mediaId, items, info, partial);
   setProgress(items.length, total || items.length, `同步完成：${items.length} / ${total || items.length}`);
   msg(`已同步并缓存 ${items.length} 个视频。`);
@@ -384,6 +496,8 @@ async function clearCurrentCache() {
   await dbDelete('items', mediaId);
   state.items = [];
   state.info = null;
+  state.syncResumeAvailable = false;
+  els.syncBtn.textContent = '慢速同步';
   resetRenderLimit();
   render();
   setProgress(0, 1, '已清除当前收藏夹缓存');
@@ -392,6 +506,25 @@ async function clearCurrentCache() {
 
 function numberLike(v) { return Number(v || 0); }
 function textLike(v) { return String(v || '').toLocaleLowerCase('zh-CN'); }
+function randomItemKey(item) {
+  return itemBvid(item) || String(item?.id || item?.aid || item?.rid || '');
+}
+function resetRandomShuffle() {
+  state.randomSortedItems = null;
+  state.randomSortedSignature = '';
+}
+function shuffleItems(items) {
+  const signature = items.map(randomItemKey).join('\u0001');
+  if (state.randomSortedItems && state.randomSortedSignature === signature) return state.randomSortedItems;
+  const shuffled = [...items];
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  state.randomSortedItems = shuffled;
+  state.randomSortedSignature = signature;
+  return shuffled;
+}
 function getValue(item, key) {
   switch (key) {
     case 'fav_time': return numberLike(item.fav_time || item.mtime);
@@ -414,9 +547,11 @@ function compareValues(a, b, dir) {
 function sortedItems() {
   const rules = [[els.sort1.value, els.dir1.value], [els.sort2.value, els.dir2.value], [els.sort3.value, els.dir3.value]].filter(([k]) => k && k !== 'none');
   const kw = textLike(els.keyword.value).trim();
-  return [...state.items]
-    .filter(item => !kw || textLike(item.title).includes(kw) || textLike(item.upper?.name).includes(kw))
-    .sort((a, b) => {
+  const filtered = [...state.items].filter(item => !kw || textLike(item.title).includes(kw) || textLike(item.upper?.name).includes(kw));
+  if (els.randomSort?.checked === true) {
+    return shuffleItems(filtered);
+  }
+  return filtered.sort((a, b) => {
       for (const [key, dir] of rules) {
         const r = compareValues(getValue(a, key), getValue(b, key), dir);
         if (r !== 0) return r;
@@ -441,9 +576,22 @@ function fmtDate(ts) {
   return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
 }
 function videoUrl(item) {
-  if (item.link?.startsWith('http')) return item.link;
+  if (isAllowedVideoUrl(item?.link)) return item.link;
   const bvid = item.bvid || item.bv_id;
-  return bvid ? `https://www.bilibili.com/video/${bvid}` : `https://www.bilibili.com/video/av${item.id}`;
+  return bvid
+    ? `https://www.bilibili.com/video/${encodeURIComponent(String(bvid))}`
+    : `https://www.bilibili.com/video/av${encodeURIComponent(String(item.id || item.aid || item.rid || ''))}`;
+}
+
+function isAllowedVideoUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ''));
+  } catch (_) {
+    return false;
+  }
+  if (url.protocol !== 'https:' || !['bilibili.com', 'www.bilibili.com'].includes(url.hostname.toLowerCase())) return false;
+  return /^\/video\/(?:BV[0-9A-Za-z]+|av\d+)(?:\/|$)/i.test(url.pathname);
 }
 function itemBvid(item) { return String(item?.bvid || item?.bv_id || '').trim(); }
 function cssEscapeValue(value) {
@@ -502,12 +650,12 @@ async function showSidePreview(item, sourceEl) {
   box.style.height = `${height}px`;
 
   const iframe = document.createElement('iframe');
-  iframe.src = `https://player.bilibili.com/player.html?bvid=${encodeURIComponent(bvid)}&page=1&autoplay=1&muted=${settings.previewMuted === false ? '0' : '1'}&t=0&danmaku=0&high_quality=0&as_wide=1&bfs_preview=1&bfs_rate=${encodeURIComponent(settings.previewRate || 4)}&bfs_speed=${encodeURIComponent(settings.previewRate || 4)}`;
+  iframe.src = `https://player.bilibili.com/player.html?bvid=${encodeURIComponent(bvid)}&page=1&autoplay=1&muted=${settings.previewMuted === false ? '0' : '1'}&t=0&danmaku=0&high_quality=0&as_wide=1&bfs_preview=1&bfs_rate=${encodeURIComponent(settings.previewRate || 4)}&bfs_speed=${encodeURIComponent(settings.previewRate || 4)}&bfs_volume=${encodeURIComponent(settings.previewVolume ?? 70)}`;
   iframe.allow = 'autoplay; fullscreen; picture-in-picture';
   iframe.referrerPolicy = 'origin-when-cross-origin';
   const title = document.createElement('div');
   title.className = 'preview-title';
-  title.textContent = `${settings.previewRate || 4}x 预览前 30s · 点击进入详情页${settings.previewMuted === false ? ' · 声音开启' : ''}`;
+  title.textContent = `${settings.previewRate || 4}x 悬停预览 · 点击进入详情页${settings.previewMuted === false ? ' · 声音开启' : ''}`;
   const click = document.createElement('div');
   click.className = 'preview-click';
   click.addEventListener('click', () => openVideo(videoUrl(item)));
@@ -516,8 +664,6 @@ async function showSidePreview(item, sourceEl) {
   box.addEventListener('mouseleave', closeSidePreview);
   document.body.appendChild(box);
   state.previewBox = box;
-  const realMs = Math.ceil((30000 / Math.max(0.25, Number(settings.previewRate || 4)))) + 2500;
-  state.previewTimer = setTimeout(closeSidePreview, Math.max(4500, Math.min(12000, realMs)));
 }
 async function scheduleSidePreview(item, sourceEl, event) {
   closeSidePreview();
@@ -610,8 +756,18 @@ async function unfavItem(item, mediaId = currentFolderId(), source = 'sidepanel'
   if (!aid) throw new Error('无法识别该视频 aid，不能取消收藏。');
   const { shortcutScope = 'selected' } = await chrome.storage.local.get(['shortcutScope']);
   const result = await send('UNFAV_AID', { aid, folderId: mediaId, scope: shortcutScope });
-  const folderIds = shortcutScope === 'all' ? (result.folderIds || []) : [mediaId];
-  await storeTrash(item, mediaId, source);
+  const folderIds = [...new Set(
+    (shortcutScope === 'all' ? (result.folderIds || []) : [mediaId])
+      .map(value => String(value).trim())
+      .filter(value => /^\d+$/.test(value) && value !== '0')
+  )];
+  if (!folderIds.length) throw new Error('取消收藏成功，但没有返回可恢复的收藏夹。');
+  for (const folderId of folderIds) {
+    const cache = String(folderId) === currentFolderId() ? null : await dbGet('items', folderId);
+    const folderItem = cache?.items?.find(v => Number(v.id || v.aid || v.rid) === aid) || item;
+    await storeTrash(folderItem, folderId, source, false);
+  }
+  await renderTrash();
   await removeAidFromCache(aid, folderIds, false);
   const all = currentSortedItems();
   if (all.length) selectIndex(Math.min(state.selectedIndex, all.length - 1), { scroll: false, silent: true });
@@ -724,12 +880,12 @@ function render() {
   if (state.items.length) msg(`当前显示 ${items.length} / 筛选后 ${allItems.length} / 已加载 ${state.items.length}`);
 }
 
-async function storeTrash(item, folderId, source = 'unknown') {
+async function storeTrash(item, folderId, source = 'unknown', shouldRender = true) {
   const aid = Number(item.id || item.aid || item.rid);
   if (!aid || !folderId) return;
-  const all = await dbAll('trash');
   const now = Date.now();
-  const dup = all.find(t => Number(t.aid) === aid && String(t.folderId) === String(folderId) && now - Number(t.deletedAt || 0) < 60000);
+  const recent = await dbTrashByAidFolder(aid, folderId);
+  const dup = recent.find(t => now - Number(t.deletedAt || 0) < 60000);
   if (dup) return;
   await dbPut('trash', {
     trashId: `${aid}_${folderId}_${now}`,
@@ -741,16 +897,17 @@ async function storeTrash(item, folderId, source = 'unknown') {
     source,
     deletedAt: now
   });
-  await renderTrash();
+  if (shouldRender) await renderTrash();
 }
 
 async function removeAidFromCache(aid, folderIds = [], createTrash = true) {
-  const ids = folderIds.length ? folderIds.map(String) : state.folders.map(f => String(f.id));
+  const ids = folderIds.map(String).filter(Boolean);
+  if (!ids.length) return;
   for (const folderId of ids) {
     const cache = await dbGet('items', folderId);
     if (!cache?.items?.length) continue;
-    const found = cache.items.find(v => Number(v.id || v.aid) === Number(aid));
-    const next = cache.items.filter(v => Number(v.id || v.aid) !== Number(aid));
+    const found = cache.items.find(v => Number(v.id || v.aid || v.rid) === Number(aid));
+    const next = cache.items.filter(v => Number(v.id || v.aid || v.rid) !== Number(aid));
     if (found && createTrash) await storeTrash(found, folderId, 'page');
     if (next.length !== cache.items.length) await saveItemsCache(folderId, next, cache.info, cache.partial);
   }
@@ -764,19 +921,19 @@ async function addItemBackToCache(item, folderId) {
   if (!item || !folderId) return;
   const cache = await dbGet('items', folderId);
   const list = cache?.items ? [...cache.items] : [];
-  if (!list.some(v => Number(v.id || v.aid) === Number(item.id || item.aid))) list.unshift(item);
+  if (!list.some(v => Number(v.id || v.aid || v.rid) === Number(item.id || item.aid || item.rid))) list.unshift(item);
   await saveItemsCache(folderId, list, cache?.info || null, cache?.partial || false);
   if (String(folderId) === currentFolderId()) {
-    if (!state.items.some(v => Number(v.id || v.aid) === Number(item.id || item.aid))) state.items.unshift(item);
+    if (!state.items.some(v => Number(v.id || v.aid || v.rid) === Number(item.id || item.aid || item.rid))) state.items.unshift(item);
     render();
   }
 }
 
 async function renderTrash() {
-  const list = (await dbAll('trash')).sort((a, b) => Number(b.deletedAt) - Number(a.deletedAt)).slice(0, 50);
+  const list = await dbRecentTrash(TRASH_DISPLAY_LIMIT);
   els.trashList.innerHTML = '';
   if (!list.length) {
-    els.trashList.textContent = '回收站为空。';
+    els.trashList.textContent = `回收站为空（最多加载最近 ${TRASH_DISPLAY_LIMIT} 条）。`;
     return;
   }
   for (const t of list) {
@@ -816,17 +973,22 @@ async function renderTrash() {
     div.append(title, meta, actions);
     els.trashList.appendChild(div);
   }
+  const hint = document.createElement('div');
+  hint.className = 'trash-meta';
+  hint.textContent = `仅加载最近 ${TRASH_DISPLAY_LIMIT} 条回收记录。`;
+  els.trashList.appendChild(hint);
 }
 
 async function applyFavEvent(event) {
-  if (!event || !event.aid) return;
-  const ids = (event.folderIds || []).map(String).filter(Boolean);
+  const aid = Number(event?.aid);
+  if (!event || !['add', 'del'].includes(event.action) || !Number.isSafeInteger(aid) || aid <= 0) return;
+  const ids = [...new Set((event.folderIds || []).map(String).filter(value => /^\d+$/.test(value) && value !== '0'))];
+  if (!ids.length) return;
   if (event.action === 'del') {
-    await removeAidFromCache(Number(event.aid), ids, true);
+    await removeAidFromCache(aid, ids, true);
     msg('检测到播放页/网页取消收藏，已同步到插件缓存。');
   } else if (event.action === 'add') {
-    const trash = await dbAll('trash');
-    const matches = trash.filter(t => Number(t.aid) === Number(event.aid) && (!ids.length || ids.includes(String(t.folderId))));
+    const matches = (await Promise.all(ids.map(folderId => dbTrashByAidFolder(aid, folderId)))).flat();
     for (const t of matches) {
       await addItemBackToCache(t.item, t.folderId);
       await dbDelete('trash', t.trashId);
@@ -967,11 +1129,27 @@ function bindEvents() {
   els.clearCacheBtn.addEventListener('click', () => clearCurrentCache().catch(e => msg(e.message)));
   els.folderSelect.addEventListener('change', async () => { state.selectedFolderId = currentFolderId(); await saveSettings(); await openCacheForCurrentFolder(); });
   [els.sort1, els.sort2, els.sort3, els.dir1, els.dir2, els.dir3, els.keyword].forEach(el => {
-    const rerender = () => { saveSettings(); resetRenderLimit(); render(); };
+    const rerender = () => {
+      if ([els.sort1, els.sort2, els.sort3, els.dir1, els.dir2, els.dir3].includes(el)) resetRandomShuffle();
+      saveSettings();
+      resetRenderLimit();
+      render();
+    };
     el.addEventListener('input', rerender);
     el.addEventListener('change', rerender);
   });
-  [els.shortcutScope, els.shortcutKey, els.previewEnabled, els.previewSound, els.previewRequireAlt, els.previewHoverDelay, els.previewRate, els.preserveVideoRate, els.focusPageAfterOpen, els.preservePlayerMode, els.theaterLayout, els.sideKeyboardEnabled, els.renderBatchSize].filter(Boolean).forEach(el => {
+  els.randomSort?.addEventListener('change', () => {
+    resetRandomShuffle();
+    updateSortControls();
+    saveSettings();
+    resetRenderLimit();
+    render();
+  });
+  els.randomReshuffleBtn?.addEventListener('click', () => {
+    resetRandomShuffle();
+    render();
+  });
+  [els.shortcutScope, els.shortcutKey, els.previewEnabled, els.previewSound, els.previewRequireAlt, els.previewHoverDelay, els.previewRate, els.previewVolume, els.preserveVideoRate, els.focusPageAfterOpen, els.preservePlayerMode, els.theaterLayout, els.sideKeyboardEnabled, els.renderBatchSize].filter(Boolean).forEach(el => {
     el.addEventListener('input', () => { saveSettings(); if (el === els.renderBatchSize) { resetRenderLimit(); render(); } });
     el.addEventListener('change', () => { saveSettings(); if (el === els.renderBatchSize) { resetRenderLimit(); render(); } });
   });
@@ -984,10 +1162,18 @@ function bindEvents() {
   els.gotoCurrentBtn?.addEventListener('click', () => gotoCurrentVideo().catch(e => msg(e.message || String(e))));
   els.theaterLayout?.addEventListener('change', () => applyActiveLayoutSettings());
   els.preservePlayerMode?.addEventListener('change', () => applyActiveLayoutSettings());
+  els.trashPanel?.addEventListener('toggle', () => {
+    if (els.trashPanel.open) renderTrash().catch(e => msg(e.message || String(e)));
+  });
   els.exportJsonBtn.addEventListener('click', exportJson);
   els.exportCsvBtn.addEventListener('click', exportCsv);
   els.refreshTrashBtn.addEventListener('click', () => renderTrash().catch(e => msg(e.message)));
-  els.clearTrashBtn.addEventListener('click', async () => { await dbClear('trash'); await renderTrash(); msg('已清空插件回收站。'); });
+  els.clearTrashBtn.addEventListener('click', async () => {
+    if (!window.confirm('确定清空插件回收站吗？移出的记录将无法恢复。')) return;
+    await dbClear('trash');
+    await renderTrash();
+    msg('已清空插件回收站。');
+  });
 }
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -1010,7 +1196,7 @@ window.addEventListener('blur', closeSidePreview);
   } else {
     msg('还没有缓存。先打开一个 B 站页面，然后点“刷新收藏夹”。');
   }
-  await renderTrash();
+  els.trashList.textContent = `展开回收站后加载最近 ${TRASH_DISPLAY_LIMIT} 条记录。`;
   await applyPendingEvents();
 })().catch(e => {
   els.userStatus.textContent = '初始化失败';

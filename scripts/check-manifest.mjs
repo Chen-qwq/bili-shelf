@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
 const required = [
@@ -23,3 +24,22 @@ if (manifest.manifest_version !== 3) {
 }
 
 console.log(`manifest.json OK: ${manifest.name} v${manifest.version}`);
+
+const scriptFiles = [
+  'background.js',
+  'content.js',
+  'page-hook.js',
+  'preview-frame.js',
+  'sidepanel.js'
+];
+
+for (const file of scriptFiles) {
+  const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    console.error(`${file} 语法检查失败：`);
+    console.error(result.stderr || result.stdout || `退出码 ${result.status}`);
+    process.exit(1);
+  }
+}
+
+console.log(`JavaScript syntax OK: ${scriptFiles.join(', ')}`);

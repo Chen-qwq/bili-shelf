@@ -10,6 +10,7 @@
   let currentAnchor = null;
   let settingsCache = null;
   let settingsLoadedAt = 0;
+  let pageHookTokenCache = '';
   let shortcutBusy = false;
 
   const DEFAULT_SETTINGS = {
@@ -18,6 +19,7 @@
     previewRequireAlt: true,
     previewHoverDelay: 2000,
     previewRate: 4,
+    previewVolume: 70,
     shortcutKey: 'u',
     preserveVideoRate: true,
     focusPageAfterOpen: true,
@@ -33,6 +35,39 @@
     return `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
   }
 
+  function createPageHookToken() {
+    try {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      if (crypto.getRandomValues) {
+        return Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16)).join('-');
+      }
+    } catch (_) {}
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function pageHookToken() {
+    const root = document.documentElement;
+    if (!root) return '';
+    if (!pageHookTokenCache) {
+      pageHookTokenCache = createPageHookToken();
+      root.dataset.biliShelfHookToken = pageHookTokenCache;
+    }
+    return pageHookTokenCache;
+  }
+
+  function normalizePageFavEvent(event) {
+    if (!event || !['add', 'del'].includes(event.action)) return null;
+    const aid = Number(event.aid);
+    if (!Number.isSafeInteger(aid) || aid <= 0) return null;
+    const folderIds = [...new Set(
+      (Array.isArray(event.folderIds) ? event.folderIds : [])
+        .map(value => String(value).trim())
+        .filter(value => /^\d+$/.test(value) && value !== '0')
+    )].slice(0, 100);
+    if (!folderIds.length) return null;
+    return { action: event.action, aid, folderIds };
+  }
+
   function send(type, payload = {}) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({ type, ...payload }, response => {
@@ -43,9 +78,9 @@
     });
   }
 
-  async function getSettings() {
+  async function getSettings(force = false) {
     const now = Date.now();
-    if (settingsCache && now - settingsLoadedAt < 1200) return settingsCache;
+    if (!force && settingsCache && now - settingsLoadedAt < 1200) return settingsCache;
     try {
       const s = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
       settingsCache = { ...DEFAULT_SETTINGS, ...s };
@@ -136,6 +171,7 @@
       html.bili-shelf-theater-layout .bili-header__bar,
       html.bili-shelf-theater-layout .mini-header,
       html.bili-shelf-theater-layout .international-header,
+      html.bili-shelf-theater-layout #biliMainHeader,
       html.bili-shelf-theater-layout .right-container,
       html.bili-shelf-theater-layout .recommend-container,
       html.bili-shelf-theater-layout .recommend-list,
@@ -144,14 +180,25 @@
       html.bili-shelf-theater-layout .video-info-container,
       html.bili-shelf-theater-layout .video-desc-container,
       html.bili-shelf-theater-layout .video-toolbar-container,
+      html.bili-shelf-theater-layout .video-tag-container,
       html.bili-shelf-theater-layout .left-container-under-player,
+      html.bili-shelf-theater-layout #commentapp,
       html.bili-shelf-theater-layout .comment-m,
       html.bili-shelf-theater-layout .comment,
       html.bili-shelf-theater-layout .reply-warp,
+      html.bili-shelf-theater-layout .video-note-sidebar-panel,
+      html.bili-shelf-theater-layout .video-note-sidebar-chapter-layer,
+      html.bili-shelf-theater-layout .video-note-sidebar-chapter-portal,
       html.bili-shelf-theater-layout .ad-report,
       html.bili-shelf-theater-layout #bannerAd,
       html.bili-shelf-theater-layout #right-bottom-banner {
         display: none !important;
+      }
+      html.bili-shelf-theater-layout,
+      html.bili-shelf-theater-layout body {
+        min-width: 0 !important;
+        max-width: 100% !important;
+        overflow-x: hidden !important;
       }
       html.bili-shelf-theater-layout #app,
       html.bili-shelf-theater-layout .video-container-v1,
@@ -164,13 +211,26 @@
       html.bili-shelf-theater-layout #bilibili-player,
       html.bili-shelf-theater-layout .bpx-player-container {
         width: 100% !important;
+        min-width: 0 !important;
         max-width: none !important;
         margin-left: 0 !important;
         margin-right: 0 !important;
       }
+      html.bili-shelf-theater-layout .player-wrap,
+      html.bili-shelf-theater-layout .player-wrap-v1,
+      html.bili-shelf-theater-layout #bilibili-player,
+      html.bili-shelf-theater-layout .bpx-player-container {
+        height: auto !important;
+        min-height: 0 !important;
+      }
+      html.bili-shelf-theater-layout .video-container-v1 {
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
       html.bili-shelf-theater-layout .left-container,
       html.bili-shelf-theater-layout .left-container-v1,
       html.bili-shelf-theater-layout .video-left-container {
+        flex: 0 0 100% !important;
         padding-left: 0 !important;
         padding-right: 0 !important;
       }
@@ -178,15 +238,24 @@
     document.documentElement.appendChild(style);
   }
 
-  async function applyTheaterLayoutFromSettings() {
+  async function applyTheaterLayoutFromSettings({ fresh = false } = {}) {
     if (!isVideoPage()) return;
-    const settings = await getSettings();
+    const settings = await getSettings(fresh);
     if (settings.theaterLayout === true) {
       ensureTheaterStyle();
       document.documentElement.classList.add('bili-shelf-theater-layout');
+      ensureTheaterWebFullscreen();
     } else {
       document.documentElement.classList.remove('bili-shelf-theater-layout');
+      clearInterval(theaterWebFullscreenInterval);
     }
+    try {
+      const notifyResize = () => window.dispatchEvent(new Event('resize'));
+      requestAnimationFrame(notifyResize);
+      setTimeout(notifyResize, 120);
+      setTimeout(notifyResize, 600);
+      setTimeout(notifyResize, 1600);
+    } catch (_) {}
   }
 
   function playerContainer() {
@@ -258,6 +327,33 @@
     }
   }
 
+  let theaterWebFullscreenInterval = 0;
+  function ensureTheaterWebFullscreen() {
+    clearInterval(theaterWebFullscreenInterval);
+    if (!document.documentElement.classList.contains('bili-shelf-theater-layout')) return;
+    const apply = () => {
+      if (!document.documentElement.classList.contains('bili-shelf-theater-layout')) {
+        clearInterval(theaterWebFullscreenInterval);
+        return;
+      }
+      if (isWebFullscreenMode()) {
+        clearInterval(theaterWebFullscreenInterval);
+        recordPlayerLayout();
+        return;
+      }
+      if (clickPlayerButton('web')) recordPlayerLayout();
+    };
+    apply();
+    const start = Date.now();
+    theaterWebFullscreenInterval = setInterval(() => {
+      if (Date.now() - start > 12000 || isWebFullscreenMode()) {
+        clearInterval(theaterWebFullscreenInterval);
+        return;
+      }
+      apply();
+    }, 900);
+  }
+
   let layoutRecordTimer = 0;
   async function recordPlayerLayout() {
     if (!isVideoPage()) return;
@@ -312,8 +408,17 @@
     const record = () => recordPlayerLayout();
     document.addEventListener('click', record, true);
     document.addEventListener('fullscreenchange', record, true);
-    const obs = new MutationObserver(record);
-    try { obs.observe(document.documentElement, { attributes: true, childList: true, subtree: true, attributeFilter: ['class'] }); } catch (_) {}
+    let mutationTimer = 0;
+    const scheduleRecord = () => {
+      if (mutationTimer) return;
+      mutationTimer = setTimeout(() => {
+        mutationTimer = 0;
+        record();
+      }, 500);
+    };
+    const target = document.querySelector('#bilibili-player, .bpx-player-container, .bilibili-player, .player-wrap, .player-wrap-v1') || document.body;
+    const obs = new MutationObserver(scheduleRecord);
+    try { obs.observe(target || document.documentElement, { attributes: true, subtree: true, attributeFilter: ['class'] }); } catch (_) {}
     setTimeout(record, 1000);
     setTimeout(restorePendingPlayerLayout, 500);
     setTimeout(restorePendingPlayerLayout, 1800);
@@ -373,8 +478,28 @@
       recordPlaybackRate(video);
     };
     document.querySelectorAll('video').forEach(bind);
-    const obs = new MutationObserver(() => document.querySelectorAll('video').forEach(bind));
-    obs.observe(document.documentElement || document, { childList: true, subtree: true });
+    const pendingNodes = new Set();
+    let bindTimer = 0;
+    const flushPendingNodes = () => {
+      bindTimer = 0;
+      const nodes = [...pendingNodes];
+      pendingNodes.clear();
+      for (const node of nodes) {
+        if (node.matches?.('video')) bind(node);
+        node.querySelectorAll?.('video').forEach(bind);
+      }
+    };
+    const queueAddedNode = node => {
+      if (node?.nodeType !== 1) return;
+      pendingNodes.add(node);
+      if (!bindTimer) bindTimer = setTimeout(flushPendingNodes, 120);
+    };
+    const obs = new MutationObserver(records => {
+      for (const record of records) {
+        for (const node of record.addedNodes) queueAddedNode(node);
+      }
+    });
+    obs.observe(document.body || document.documentElement || document, { childList: true, subtree: true });
     restorePendingPlaybackRate({ focus: true });
   }
 
@@ -492,7 +617,7 @@
     });
 
     const bar = document.createElement('div');
-    bar.textContent = `${settings.previewRate || 4}x 预览前 30s · 点击进入详情页${settings.previewMuted ? '' : ' · 声音开启'}`;
+    bar.textContent = `${settings.previewRate || 4}x 悬停预览 · 点击进入详情页${settings.previewMuted ? '' : ' · 声音开启'}`;
     Object.assign(bar.style, {
       position: 'absolute',
       left: '0',
@@ -511,7 +636,7 @@
     const iframe = document.createElement('iframe');
     const muted = settings.previewMuted ? '1' : '0';
     const rate = encodeURIComponent(String(settings.previewRate || 4));
-    iframe.src = `https://player.bilibili.com/player.html?bvid=${encodeURIComponent(bvid)}&page=1&autoplay=1&muted=${muted}&t=0&danmaku=0&high_quality=0&as_wide=1&bfs_preview=1&bfs_rate=${rate}&bfs_speed=${rate}`;
+    iframe.src = `https://player.bilibili.com/player.html?bvid=${encodeURIComponent(bvid)}&page=1&autoplay=1&muted=${muted}&t=0&danmaku=0&high_quality=0&as_wide=1&bfs_preview=1&bfs_rate=${rate}&bfs_speed=${rate}&bfs_volume=${encodeURIComponent(settings.previewVolume ?? 70)}`;
     iframe.allow = 'autoplay; fullscreen; picture-in-picture';
     iframe.referrerPolicy = 'origin-when-cross-origin';
     Object.assign(iframe.style, {
@@ -537,8 +662,6 @@
     previewBox.addEventListener('mouseenter', () => clearTimeout(leaveTimer));
     previewBox.addEventListener('mouseleave', () => closePreview());
     document.documentElement.appendChild(previewBox);
-    const realMs = Math.ceil((30000 / Math.max(0.25, Number(settings.previewRate || 4)))) + 2500;
-    previewTimer = setTimeout(closePreview, Math.max(4500, Math.min(12000, realMs)));
   }
 
   function getVideoAnchor(target) {
@@ -632,7 +755,7 @@
       return true;
     }
     if (message?.type === 'BILI_SHELF_APPLY_LAYOUT_SETTINGS') {
-      applyTheaterLayoutFromSettings().then(() => restorePendingPlayerLayout()).finally(() => {
+      applyTheaterLayoutFromSettings({ fresh: true }).then(() => restorePendingPlayerLayout()).finally(() => {
         try { sendResponse?.({ ok: true, layout: getPlayerLayout() }); } catch (_) {}
       });
       return true;
@@ -647,6 +770,7 @@
   });
 
   function injectPageHook() {
+    pageHookToken();
     if (document.documentElement.dataset.bfsHookInjected === '1') return;
     document.documentElement.dataset.bfsHookInjected = '1';
     const script = document.createElement('script');
@@ -659,7 +783,10 @@
     if (event.source !== window) return;
     const data = event.data;
     if (!data || data.source !== 'BILI_FAV_SORTER_PAGE_HOOK') return;
-    chrome.runtime.sendMessage({ type: 'BILI_PAGE_FAV_CHANGED', event: data.event }, () => void chrome.runtime.lastError);
+    if (data.token !== pageHookToken()) return;
+    const eventData = normalizePageFavEvent(data.event);
+    if (!eventData) return;
+    chrome.runtime.sendMessage({ type: 'BILI_PAGE_FAV_CHANGED', event: eventData }, () => void chrome.runtime.lastError);
   });
 
   window.addEventListener('scroll', closePreview, { passive: true, capture: true });

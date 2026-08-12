@@ -20,9 +20,10 @@
     "scripting"
   ],
   "host_permissions": [
-    "https://*.bilibili.com/*",
+    "https://www.bilibili.com/*",
     "https://api.bilibili.com/*",
-    "https://space.bilibili.com/*"
+    "https://space.bilibili.com/*",
+    "https://player.bilibili.com/*"
   ],
   "web_accessible_resources": [
     {
@@ -30,14 +31,16 @@
         "page-hook.js"
       ],
       "matches": [
-        "https://*.bilibili.com/*"
+        "https://www.bilibili.com/*",
+        "https://space.bilibili.com/*"
       ]
     }
   ],
   "content_scripts": [
     {
       "matches": [
-        "https://*.bilibili.com/*"
+        "https://www.bilibili.com/*",
+        "https://space.bilibili.com/*"
       ],
       "js": [
         "content.js"

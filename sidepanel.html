@@ -45,6 +45,12 @@
         <input id="keyword" placeholder="标题 / UP主" />
       </label>
       <div></div>
+      <label class="checkline wide">
+        <input id="randomSort" type="checkbox" />
+        <span>随机排序（使用“随机重排”重新洗牌）</span>
+      </label>
+      <button id="randomReshuffleBtn" class="wide hidden" type="button">随机重排</button>
+      <div id="sortFields" class="wide grid2">
       <label class="field">
         <span>第一排序</span>
         <select id="sort1"></select>
@@ -69,6 +75,7 @@
         <span>方向</span>
         <select id="dir3"><option value="desc">从大到小 / 新到旧</option><option value="asc">从小到大 / 旧到新</option></select>
       </label>
+      </div>
     </div>
   </details>
 
@@ -95,6 +102,10 @@
         <span>预览倍速</span>
         <input id="previewRate" type="number" min="0.25" max="16" step="0.25" />
       </label>
+      <label class="field">
+        <span>预览音量（0-100）</span>
+        <input id="previewVolume" type="number" min="0" max="100" step="5" />
+      </label>
       <label class="checkline wide">
         <input type="checkbox" id="preserveVideoRate" />
         <span>侧边栏打开下一个视频时保留当前播放倍速</span>
@@ -113,7 +124,7 @@
       </label>
       <label class="checkline wide">
         <input type="checkbox" id="theaterLayout" />
-        <span>播放页极简布局：左侧仅视频，右侧仅收藏架</span>
+        <span>播放页极简布局：左侧仅视频，右侧仅收藏架（自动网页全屏）</span>
       </label>
       <label class="field wide">
         <span>列表每次显示数量</span>
@@ -127,11 +138,11 @@
         <span>快捷键取消范围</span>
         <select id="shortcutScope"><option value="selected">只取消当前选中收藏夹</option><option value="all">取消所有包含该视频的收藏夹</option></select>
       </label>
-      <p class="hint wide">单键快捷键在 B 站播放页和插件侧边栏内都可用；输入框、评论框、搜索框里不会触发。“需要按住 Alt 才预览”开启时：按住 Alt + 悬停才创建播放器；关闭时：普通悬停也会预览，但更容易卡顿。列表默认分批渲染，避免一次加载几千张封面。开启“收藏架内启用键盘选择”后，可以用 ↑↓ / PageUp / PageDown / Home / End 选视频，Enter 打开，设置的取消收藏按键默认 U 会取消选中视频。开启“打开视频后尝试把焦点切回播放页”时浏览器可能仍把焦点留在侧边栏；关闭它更适合连续用收藏架选片。开启“保留当前播放倍速”后，从侧边栏切换到下一个视频会尽量沿用播放页当前倍速；开启“保留宽屏 / 网页全屏模式”后，会尽量恢复上一个播放页的宽屏、网页全屏状态；浏览器真正全屏通常需要手动触发。开启“左侧仅视频，右侧仅收藏架布局”后，播放页会隐藏推荐、评论等区域，方便配合 Edge 侧边栏使用。声音可能会受浏览器自动播放策略影响。</p>
+      <p class="hint wide">单键快捷键在 B 站播放页和插件侧边栏内都可用；输入框、评论框、搜索框里不会触发。“需要按住 Alt 才预览”开启时：按住 Alt + 悬停才创建播放器；关闭时：普通悬停也会预览，但更容易卡顿。列表默认分批渲染，避免一次加载几千张封面。开启“收藏架内启用键盘选择”后，可以用 ↑↓ / PageUp / PageDown / Home / End 选视频，Enter 打开，设置的取消收藏按键默认 U 会取消选中视频。开启“打开视频后尝试把焦点切回播放页”时浏览器可能仍把焦点留在侧边栏；关闭它更适合连续用收藏架选片。开启“保留当前播放倍速”后，从侧边栏切换到下一个视频会尽量沿用播放页当前倍速；开启“保留宽屏 / 网页全屏模式”后，会尽量恢复上一个播放页的宽屏、网页全屏状态；浏览器真正全屏通常需要手动触发。开启“左侧仅视频，右侧仅收藏架布局”后，播放页会隐藏推荐、评论等区域并自动进入网页全屏，方便配合 Edge 侧边栏使用。声音可能会受浏览器自动播放策略影响。</p>
     </div>
   </details>
 
-  <details class="panel">
+  <details id="trashPanel" class="panel">
     <summary>导出与回收站</summary>
     <div class="panel-body">
       <div class="toolbar wrap">
@@ -140,6 +151,7 @@
         <button id="refreshTrashBtn">刷新回收站</button>
         <button id="clearTrashBtn" class="danger-soft">清空回收站</button>
       </div>
+      <p class="hint">回收站展开时只加载最近 50 条记录，避免大量历史记录造成卡顿。</p>
       <div id="trashList" class="trash-list"></div>
     </div>
   </details>
