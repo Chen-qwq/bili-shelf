@@ -6,6 +6,48 @@ const BILI = {
   view: 'https://api.bilibili.com/x/web-interface/view'
 };
 
+const ALLOWED_VIDEO_HOSTS = new Set(['bilibili.com', 'www.bilibili.com']);
+const BILI_PAGE_PATTERNS = [
+  'https://www.bilibili.com/*',
+  'https://space.bilibili.com/*'
+];
+
+function isAllowedVideoUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ''));
+  } catch (_) {
+    return false;
+  }
+  if (url.protocol !== 'https:' || !ALLOWED_VIDEO_HOSTS.has(url.hostname.toLowerCase())) return false;
+  return /^\/video\/(?:BV[0-9A-Za-z]+|av\d+)(?:\/|$)/i.test(url.pathname);
+}
+
+function normalizeFavEvent(event, source = 'unknown', requireFolderIds = false) {
+  if (!event || !['add', 'del'].includes(event.action)) return null;
+  const aid = Number(event.aid ?? event.rid);
+  if (!Number.isSafeInteger(aid) || aid <= 0) return null;
+
+  const folderIds = [...new Set(
+    (Array.isArray(event.folderIds) ? event.folderIds : [])
+      .map(value => String(value).trim())
+      .filter(value => /^\d+$/.test(value) && value !== '0')
+  )].slice(0, 100);
+  if (requireFolderIds && !folderIds.length) return null;
+
+  const bvid = /^BV[0-9A-Za-z]+$/i.test(String(event.bvid || ''))
+    ? String(event.bvid)
+    : '';
+  return {
+    action: event.action,
+    aid,
+    bvid,
+    folderIds,
+    source,
+    ts: Date.now()
+  };
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -31,9 +73,9 @@ function formatHttp412() {
 }
 
 async function findBiliTab() {
-  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: ['https://*.bilibili.com/*'] });
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: BILI_PAGE_PATTERNS });
   if (active?.id) return active;
-  const tabs = await chrome.tabs.query({ url: ['https://*.bilibili.com/*'] });
+  const tabs = await chrome.tabs.query({ url: BILI_PAGE_PATTERNS });
   return tabs.find(t => t.id && !t.discarded) || null;
 }
 
@@ -232,19 +274,12 @@ async function addPendingFavEvent(event) {
 }
 
 async function broadcastFavChange(event) {
-  const normalized = {
-    type: 'BILI_FAV_CHANGED',
-    event: {
-      action: event.action,
-      aid: Number(event.aid || event.rid || 0),
-      bvid: event.bvid || '',
-      folderIds: (event.folderIds || []).map(String).filter(Boolean),
-      source: event.source || 'unknown',
-      ts: event.ts || Date.now()
-    }
-  };
-  await addPendingFavEvent(normalized.event);
+  const eventData = normalizeFavEvent(event, event?.source || 'unknown', true);
+  if (!eventData) return false;
+  const normalized = { type: 'BILI_FAV_CHANGED', event: eventData };
+  await addPendingFavEvent(eventData);
   try { chrome.runtime.sendMessage(normalized); } catch (_) {}
+  return true;
 }
 
 function extractBvidFromAnyUrl(url = '') {
@@ -315,6 +350,7 @@ async function focusPageWhenReady(tabId) {
 }
 
 async function openInActiveTab(url) {
+  if (!isAllowedVideoUrl(url)) throw new Error('只能打开 HTTPS B 站视频地址。');
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   const { preserveVideoRate = true, focusPageAfterOpen = true, preservePlayerMode = true, theaterLayout = false } = await chrome.storage.local.get(['preserveVideoRate', 'focusPageAfterOpen', 'preservePlayerMode', 'theaterLayout']);
   const targetBvid = extractBvidFromAnyUrl(url);
@@ -326,6 +362,7 @@ async function openInActiveTab(url) {
       await chrome.storage.local.set({
         pendingPlayerLayoutRestore: {
           ...layout,
+          webFullscreen: theaterLayout === true || layout.webFullscreen === true,
           bvid: targetBvid || '',
           url,
           theaterLayout: theaterLayout === true,
@@ -383,6 +420,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'GET_VIEW_BY_BVID':
         return await getViewInfoByBvid(message.bvid);
       case 'OPEN_IN_ACTIVE_TAB':
+        if (!isAllowedVideoUrl(message.url)) throw new Error('只能打开 HTTPS B 站视频地址。');
         return await openInActiveTab(message.url);
       case 'GET_ACTIVE_VIDEO_INFO': {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -390,7 +428,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { bvid, url: tab?.url || '', tabId: tab?.id || 0 };
       }
       case 'APPLY_ACTIVE_LAYOUT_SETTINGS': {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: ['https://*.bilibili.com/*'] });
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: BILI_PAGE_PATTERNS });
         if (tab?.id) {
           try { await chrome.tabs.sendMessage(tab.id, { type: 'BILI_SHELF_APPLY_LAYOUT_SETTINGS' }); } catch (_) {}
         }
@@ -407,10 +445,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ...result, bvid };
       }
       case 'BILI_PAGE_FAV_CHANGED': {
-        const ev = message.event || {};
-        if (ev.action === 'del' || ev.action === 'add') {
-          await broadcastFavChange({ ...ev, source: 'bilibili-page', ts: Date.now() });
-        }
+        const ev = normalizeFavEvent(message.event, 'bilibili-page', true);
+        if (!ev) return { received: false };
+        await broadcastFavChange(ev);
         return { received: true };
       }
       case 'GET_PENDING_FAV_EVENTS': {

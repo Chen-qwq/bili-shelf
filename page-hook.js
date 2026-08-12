@@ -2,6 +2,9 @@
   if (window.__BILI_FAV_SORTER_HOOKED__) return;
   window.__BILI_FAV_SORTER_HOOKED__ = true;
 
+  const hookToken = document.documentElement?.dataset?.biliShelfHookToken || '';
+  if (!hookToken) return;
+
   function parseBody(body) {
     try {
       if (!body) return new URLSearchParams();
@@ -29,6 +32,7 @@
       if (!action || !folderIds.length) return;
       window.postMessage({
         source: 'BILI_FAV_SORTER_PAGE_HOOK',
+        token: hookToken,
         event: {
           action,
           aid: Number(rid),

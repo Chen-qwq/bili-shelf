@@ -7,15 +7,15 @@
 
   const DEFAULT = {
     previewMuted: params.get('muted') !== '0',
-    previewRate: Number(params.get('bfs_rate') || params.get('bfs_speed') || 4) || 4
+    previewRate: Number(params.get('bfs_rate') || params.get('bfs_speed') || 4) || 4,
+    previewVolume: Number(params.get('bfs_volume') ?? 70)
   };
 
   let styleInjected = false;
   let lastTuneAt = 0;
   let observer = null;
   let intervalId = 0;
-  const closeAfterMs = Math.max(4500, Math.min(12000, Math.ceil(30000 / Math.max(0.25, Number(DEFAULT.previewRate || 4))) + 2500));
-  const stopAt = Date.now() + closeAfterMs;
+  let tuneTimer = 0;
 
   function injectStyle() {
     if (styleInjected || document.getElementById('bfs-preview-clean-style')) return;
@@ -80,7 +80,7 @@
 
   async function getSettings() {
     try {
-      const s = await chrome.storage.local.get(['previewMuted', 'previewRate']);
+      const s = await chrome.storage.local.get(['previewMuted', 'previewRate', 'previewVolume']);
       return { ...DEFAULT, ...s };
     } catch (_) {
       return DEFAULT;
@@ -89,10 +89,6 @@
 
   async function tuneVideo(force = false) {
     const now = Date.now();
-    if (now > stopAt) {
-      cleanup();
-      return;
-    }
     if (!force && now - lastTuneAt < 600) return;
     lastTuneAt = now;
     injectStyle();
@@ -100,6 +96,8 @@
     const settings = await getSettings();
     const rate = Math.max(0.25, Math.min(16, Number(settings.previewRate || 4)));
     const muted = settings.previewMuted !== false;
+    const volumePercent = Number(settings.previewVolume);
+    const volume = Number.isFinite(volumePercent) ? Math.max(0, Math.min(100, volumePercent)) / 100 : 0.7;
     const videos = Array.from(document.querySelectorAll('video'));
 
     for (const video of videos) {
@@ -107,13 +105,9 @@
         video.controls = false;
         video.muted = muted;
         video.defaultMuted = muted;
-        if (!muted) video.volume = Math.max(video.volume || 0.7, 0.7);
+        video.volume = volume;
         video.defaultPlaybackRate = rate;
         video.playbackRate = rate;
-        if (video.currentTime >= 30) {
-          video.pause();
-          continue;
-        }
         const p = video.play?.();
         if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch (_) {}
@@ -123,6 +117,7 @@
   function cleanup() {
     try { observer?.disconnect?.(); } catch (_) {}
     if (intervalId) clearInterval(intervalId);
+    if (tuneTimer) clearTimeout(tuneTimer);
     for (const video of document.querySelectorAll('video')) {
       try {
         video.pause();
@@ -132,12 +127,19 @@
     }
   }
 
+  function scheduleTune() {
+    if (tuneTimer) return;
+    tuneTimer = setTimeout(() => {
+      tuneTimer = 0;
+      tuneVideo(false);
+    }, 150);
+  }
+
   function boot() {
     tuneVideo(true);
-    observer = new MutationObserver(() => tuneVideo(false));
-    observer.observe(document.documentElement || document, { childList: true, subtree: true });
+    observer = new MutationObserver(scheduleTune);
+    observer.observe(document.body || document.documentElement || document, { childList: true, subtree: true });
     intervalId = setInterval(() => tuneVideo(false), 1500);
-    setTimeout(cleanup, closeAfterMs);
     document.addEventListener('playing', () => tuneVideo(true), true);
     document.addEventListener('loadedmetadata', () => tuneVideo(true), true);
   }
