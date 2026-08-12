@@ -1,0 +1,58 @@
+name: Build Extension Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(python3 - <<'PY'
+import json
+with open('manifest.json', 'r', encoding='utf-8') as f:
+    print(json.load(f)['version'])
+PY
+)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package extension
+        run: |
+          mkdir -p dist
+          zip -r "dist/bili-shelf-v${{ steps.version.outputs.version }}.zip" \
+            manifest.json \
+            background.js \
+            content.js \
+            page-hook.js \
+            preview-frame.js \
+            sidepanel.html \
+            sidepanel.css \
+            sidepanel.js \
+            README.md \
+            LICENSE \
+            PRIVACY.md \
+            CHANGELOG.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bili-shelf-v${{ steps.version.outputs.version }}
+          path: dist/*.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

@@ -1,0 +1,21 @@
+{
+  "name": "bili-shelf",
+  "version": "0.5.7",
+  "description": "BiliShelf 哔哩收藏架：Edge/Chrome B站收藏夹管理扩展，支持侧边栏、缓存同步、多条件排序、悬停浮窗预览、导出备份、回收站、倍速/播放模式保留、左视频右收藏架布局和快捷取消收藏和侧边栏键盘选片。",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check-manifest.mjs"
+  },
+  "keywords": [
+    "edge-extension",
+    "chrome-extension",
+    "bilibili",
+    "favorites",
+    "bili-shelf",
+    "bilishelf",
+    "side-panel",
+    "hover-preview",
+    "manifest-v3"
+  ]
+}
