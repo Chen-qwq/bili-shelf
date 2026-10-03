@@ -33,8 +33,8 @@
 提交后打标签：
 
 ```bash
-git tag v0.5.7
-git push origin v0.5.7
+git tag v0.5.8
+git push origin v0.5.8
 ```
 
 GitHub Actions 会自动打包扩展 zip 并上传到 Release。

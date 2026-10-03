@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BiliShelf 哔哩收藏架",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "B站收藏夹管理扩展：侧边栏浏览、缓存同步、多条件排序、悬停浮窗预览、导出备份、回收站、倍速/播放模式保留、左视频右收藏架布局和快捷取消收藏和侧边栏键盘选片。",
   "action": {
     "default_title": "打开 BiliShelf 哔哩收藏架"

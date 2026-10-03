@@ -1,4 +1,4 @@
-# BiliShelf 哔哩收藏架 v0.5.7
+# BiliShelf 哔哩收藏架 v0.5.8
 
 **BiliShelf** 是一个非官方 B 站收藏夹管理浏览器扩展，用侧边栏整理你的收藏夹，支持本地缓存、多条件排序、关键词筛选、悬停浮窗预览、导出备份、插件回收站、倍速/播放模式保留、左视频右收藏架布局、定位当前视频、侧边栏键盘选片和快捷取消收藏。
 
@@ -105,8 +105,8 @@ git push -u origin main
 发布版本：
 
 ```bash
-git tag v0.5.7
-git push origin v0.5.7
+git tag v0.5.8
+git push origin v0.5.8
 ```
 
 仓库内置 GitHub Actions。推送 `v*.*.*` 标签后，会自动打包扩展 zip 并创建 GitHub Release。
