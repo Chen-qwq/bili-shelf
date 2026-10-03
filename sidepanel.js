@@ -428,8 +428,8 @@ async function slowSync() {
       const data = await send('GET_ITEMS_PAGE', { mediaId, pn, ps: CACHE_PS, order: 'mtime' });
       if (!info) {
         info = data.info || null;
-        total = Number(info?.media_count || data.medias?.length || 0);
-        pages = Math.max(1, Math.ceil(total / CACHE_PS));
+        total = Number(info?.media_count || 0);
+        pages = total > 0 ? Math.ceil(total / CACHE_PS) : 0;
       }
       const medias = (data.medias || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id);
       items.push(...medias);
@@ -448,7 +448,9 @@ async function slowSync() {
       render();
       setProgress(items.length, total || items.length, `已同步 ${items.length} / ${total || items.length}，第 ${pn} / ${pages} 页`);
       if (state.syncCancelled) throw new Error('用户中断同步');
-      if ((pages && pn >= pages) || (data.medias || []).length < CACHE_PS) {
+      const reachedExpectedPages = pages > 0 && pn >= pages;
+      const apiReportedEnd = data.hasMore === false;
+      if (reachedExpectedPages || (pages === 0 && apiReportedEnd)) {
         completed = true;
         break;
       }
