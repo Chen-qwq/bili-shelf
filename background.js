@@ -49,6 +49,15 @@ function normalizeFavEvent(event, source = 'unknown', requireFolderIds = false) 
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const API_TIMEOUT_MS = 20000;
+const activeRequestTabs = new Map();
+const activeRequestControllers = new Map();
+
+function timeoutError() {
+  const error = new Error('B站请求超时，请检查网络或稍后重试。');
+  error.code = 'TIMEOUT';
+  return error;
+}
 
 chrome.runtime.onInstalled.addListener(async () => {
   try {
@@ -82,36 +91,85 @@ async function findBiliTab() {
 async function fetchViaPage(url, options = {}) {
   const tab = await findBiliTab();
   if (!tab?.id || !chrome.scripting?.executeScript) throw new Error('没有可用的 bilibili.com 页面，请先打开或刷新一个 B 站页面。');
+  const timeoutMs = Math.max(5000, Number(options.timeoutMs || API_TIMEOUT_MS));
+  const requestId = String(options.requestId || '');
+  if (requestId) activeRequestTabs.set(requestId, tab.id);
 
-  const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: 'MAIN',
-    func: async (requestUrl, requestOptions) => {
-      const res = await fetch(requestUrl, {
-        method: requestOptions.method || 'GET',
-        credentials: 'include',
-        headers: requestOptions.headers || {},
-        body: requestOptions.body || undefined
-      });
-      return {
-        ok: res.ok,
-        status: res.status,
-        text: await res.text()
-      };
-    },
-    args: [url, options]
-  });
-  return result;
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: async (requestUrl, requestOptions, requestTimeoutMs, requestKey) => {
+        const registry = globalThis.__BFS_FETCH_CONTROLLERS__ || (globalThis.__BFS_FETCH_CONTROLLERS__ = new Map());
+        const controller = new AbortController();
+        let timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; controller.abort(); }, requestTimeoutMs);
+        if (requestKey) registry.set(requestKey, controller);
+        try {
+          const res = await fetch(requestUrl, {
+            method: requestOptions.method || 'GET',
+            credentials: 'include',
+            headers: requestOptions.headers || {},
+            body: requestOptions.body || undefined,
+            signal: controller.signal
+          });
+          return {
+            ok: res.ok,
+            status: res.status,
+            text: await res.text()
+          };
+        } catch (error) {
+          if (error?.name === 'AbortError') return { ok: false, status: 0, text: '', timedOut, aborted: !timedOut };
+          throw error;
+        } finally {
+          clearTimeout(timer);
+          if (requestKey && registry.get(requestKey) === controller) registry.delete(requestKey);
+        }
+      },
+      args: [url, options, timeoutMs, requestId]
+    });
+    if (result?.timedOut) throw timeoutError();
+    if (result?.aborted) {
+      const error = new Error('请求已取消');
+      error.code = 'ABORTED';
+      throw error;
+    }
+    return result;
+  } finally {
+    if (requestId) activeRequestTabs.delete(requestId);
+  }
 }
 
 async function fetchDirect(url, options = {}) {
-  const res = await fetch(url, {
-    method: options.method || 'GET',
-    credentials: 'include',
-    headers: options.headers || {},
-    body: options.body || undefined
-  });
-  return { ok: res.ok, status: res.status, text: await res.text() };
+  const timeoutMs = Math.max(5000, Number(options.timeoutMs || API_TIMEOUT_MS));
+  const controller = new AbortController();
+  const requestId = String(options.requestId || '');
+  const entry = { controller, cancelled: false };
+  if (requestId) activeRequestControllers.set(requestId, entry);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: options.method || 'GET',
+      credentials: 'include',
+      headers: options.headers || {},
+      body: options.body || undefined,
+      signal: controller.signal
+    });
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      if (entry.cancelled) {
+        const cancelled = new Error('请求已取消');
+        cancelled.code = 'ABORTED';
+        throw cancelled;
+      }
+      throw timeoutError();
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (requestId && activeRequestControllers.get(requestId) === entry) activeRequestControllers.delete(requestId);
+  }
 }
 
 async function apiRequest(url, options = {}) {
@@ -119,6 +177,7 @@ async function apiRequest(url, options = {}) {
   try {
     response = await fetchViaPage(url, options);
   } catch (pageError) {
+    if (pageError?.code === 'TIMEOUT' || pageError?.code === 'ABORTED') throw pageError;
     response = await fetchDirect(url, options);
   }
 
@@ -141,11 +200,13 @@ async function apiRequest(url, options = {}) {
   return json.data;
 }
 
-async function apiGet(url) {
+async function apiGet(url, extra = {}) {
   return apiRequest(url, {
-    method: 'GET',
+    ...extra,
+    method: extra.method || 'GET',
     headers: {
-      'Accept': 'application/json, text/plain, */*'
+      'Accept': 'application/json, text/plain, */*',
+      ...(extra.headers || {})
     }
   });
 }
@@ -174,7 +235,7 @@ async function getFavFolders() {
   return { user: nav, folders: data.list || [], updatedAt: Date.now() };
 }
 
-async function getFavItemsPage(mediaId, pn = 1, order = 'mtime', ps = 20) {
+async function getFavItemsPage(mediaId, pn = 1, order = 'mtime', ps = 20, requestId = '') {
   const url = new URL(BILI.resources);
   url.searchParams.set('media_id', mediaId);
   url.searchParams.set('pn', String(pn));
@@ -182,7 +243,7 @@ async function getFavItemsPage(mediaId, pn = 1, order = 'mtime', ps = 20) {
   url.searchParams.set('order', order);
   url.searchParams.set('type', '0');
   url.searchParams.set('platform', 'web');
-  const data = await apiGet(url.toString());
+  const data = await apiGet(url.toString(), { requestId });
   return {
     info: data.info || null,
     medias: data.medias || [],
@@ -402,6 +463,36 @@ async function openInActiveTab(url) {
   return { updated: false, tabId: created.id, preservedRate: rate || 0, preservedLayout: layout || null };
 }
 
+async function cancelApiRequest(requestId) {
+  const id = String(requestId || '');
+  if (!id) return { cancelled: false };
+  let cancelled = false;
+  const direct = activeRequestControllers.get(id);
+  if (direct) {
+    direct.cancelled = true;
+    direct.controller.abort();
+    cancelled = true;
+  }
+  const tabId = activeRequestTabs.get(id);
+  if (tabId && chrome.scripting?.executeScript) {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: requestKey => {
+          const controller = globalThis.__BFS_FETCH_CONTROLLERS__?.get(requestKey);
+          if (!controller) return false;
+          controller.abort();
+          return true;
+        },
+        args: [id]
+      });
+      cancelled = cancelled || result === true;
+    } catch (_) {}
+  }
+  return { cancelled };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     switch (message?.type) {
@@ -410,7 +501,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'GET_FOLDERS':
         return await getFavFolders();
       case 'GET_ITEMS_PAGE':
-        return await getFavItemsPage(message.mediaId, message.pn || 1, message.order || 'mtime', message.ps || 20);
+        return await getFavItemsPage(message.mediaId, message.pn || 1, message.order || 'mtime', message.ps || 20, message.requestId || '');
+      case 'CANCEL_API_REQUEST':
+        return await cancelApiRequest(message.requestId);
       case 'UNFAV_AID':
         return await unfavResource(message.aid, { folderId: message.folderId, folderIds: message.folderIds, scope: message.scope });
       case 'FAV_AID':

@@ -18,11 +18,15 @@ const state = {
   currentHighlightBvid: '',
   selectedIndex: -1,
   sortedCache: [],
+  sortedCacheKey: '',
+  itemsRevision: 0,
   randomSortedItems: null,
   randomSortedSignature: '',
+  randomShuffleRevision: 0,
   keyboardBusy: false,
   syncing: false,
   syncCancelled: false,
+  activeSyncRequestId: '',
   syncResumeAvailable: false
 };
 
@@ -62,9 +66,17 @@ const els = {
   message: $('#message'), list: $('#list'), loadMoreBtn: $('#loadMoreBtn'), scrollTopBtn: $('#scrollTopBtn'), gotoCurrentBtn: $('#gotoCurrentBtn'), tpl: $('#itemTpl')
 };
 
-function send(type, payload = {}) {
+function send(type, payload = {}, options = {}) {
   return new Promise((resolve, reject) => {
+    const timeoutMs = Math.max(5000, Number(options.timeoutMs || 30000));
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new Error(`请求超时：${type}`));
+    }, timeoutMs);
     chrome.runtime.sendMessage({ type, ...payload }, response => {
+      if (settled) return;
+      clearTimeout(timer);
       if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
       if (!response?.ok) return reject(new Error(response?.error || '未知错误'));
       resolve(response.data);
@@ -73,8 +85,44 @@ function send(type, payload = {}) {
 }
 
 function msg(text) { els.message.textContent = text || ''; }
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const jitter = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+
+function waitForSyncDelay(ms) {
+  return new Promise(resolve => {
+    const endAt = Date.now() + Math.max(0, Number(ms) || 0);
+    let timer = 0;
+    const check = () => {
+      if (state.syncCancelled) {
+        if (timer) clearTimeout(timer);
+        resolve(false);
+        return;
+      }
+      const remaining = endAt - Date.now();
+      if (remaining <= 0) {
+        resolve(true);
+        return;
+      }
+      timer = setTimeout(check, Math.min(250, remaining));
+    };
+    check();
+  });
+}
+
+function isRetryableSyncError(error) {
+  const text = String(error?.message || error || '');
+  return /412|429|超时|网络错误|HTTP 5\d\d|Failed to fetch/i.test(text);
+}
+
+function makeRequestId() {
+  if (globalThis.crypto?.randomUUID) return `sync-${globalThis.crypto.randomUUID()}`;
+  return `sync-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function cancelActiveSyncRequest() {
+  const requestId = state.activeSyncRequestId;
+  if (!requestId) return;
+  send('CANCEL_API_REQUEST', { requestId }, { timeoutMs: 3000 }).catch(() => {});
+}
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -344,14 +392,14 @@ async function openCacheForCurrentFolder() {
   if (!mediaId) return msg('请先选择收藏夹。');
   const cache = await dbGet('items', mediaId);
   if (!cache) {
-    state.items = [];
+    replaceStateItems([]);
     state.info = null;
     state.syncResumeAvailable = false;
     if (!state.syncing) els.syncBtn.textContent = '慢速同步';
     render();
     return msg('当前收藏夹还没有缓存，请先慢速同步。');
   }
-  state.items = (cache.items || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id);
+  replaceStateItems((cache.items || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id));
   state.info = cache.info || null;
   state.selectedFolderId = mediaId;
   state.syncResumeAvailable = Boolean(cache.partial && cache.syncState && Number(cache.syncState.nextPage) > 1);
@@ -372,16 +420,73 @@ function setProgress(done, total, text, isError = false) {
   els.progressBar.classList.toggle('error', Boolean(isError));
 }
 
+function setSyncProgress(page, pages, cachedCount, total, phase, isError = false) {
+  const pageNumber = Math.max(0, Number(page) || 0);
+  const pageTotal = Math.max(0, Number(pages) || 0);
+  const hasPageTotal = pageTotal > 0;
+  const done = hasPageTotal ? Math.min(pageNumber, pageTotal) : Math.max(0, Number(cachedCount) || 0);
+  const denominator = hasPageTotal ? pageTotal : Math.max(1, Number(total) || Number(cachedCount) || 1);
+  const pageText = hasPageTotal ? `已读取 ${done} / ${pageTotal} 页` : `已读取 ${pageNumber} 页`;
+  const cacheText = Number(total) > 0 ? `已缓存 ${cachedCount} / ${total} 个视频` : `已缓存 ${cachedCount} 个视频`;
+  setProgress(done, denominator, `${phase}，${pageText}，${cacheText}`, isError);
+}
+
+function cacheItemKey(item) {
+  const bvid = String(item?.bvid || item?.bv_id || '').trim();
+  if (bvid) return `bvid:${bvid}`;
+  const aid = Number(item?.id || item?.aid || item?.rid);
+  return Number.isSafeInteger(aid) && aid > 0 ? `aid:${aid}` : '';
+}
+
+function mergeUniqueItems(existing, incoming) {
+  const result = Array.isArray(existing) ? [...existing] : [];
+  const seen = new Set(result.map(cacheItemKey).filter(Boolean));
+  for (const item of Array.isArray(incoming) ? incoming : []) {
+    const key = cacheItemKey(item);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+function replaceStateItems(items) {
+  state.items = mergeUniqueItems([], items);
+  state.itemsRevision += 1;
+  state.sortedCache = [];
+  state.sortedCacheKey = '';
+}
+
 async function saveItemsCache(mediaId, items, info, partial = false, syncState = null) {
   await dbPut('items', {
     mediaId: String(mediaId),
     folderTitle: folderTitleById(mediaId),
     info: info || null,
-    items: items || [],
+    items: mergeUniqueItems([], items),
     partial,
     syncState: partial ? syncState : null,
     updatedAt: Date.now()
   });
+}
+
+async function getSyncPageWithRetry(payload, onRetry) {
+  const maxRetries = 3;
+  for (let attempt = 0; ; attempt += 1) {
+    if (state.syncCancelled) throw new Error('用户中断同步');
+    const requestId = payload.requestId || makeRequestId();
+    state.activeSyncRequestId = requestId;
+    try {
+      return await send('GET_ITEMS_PAGE', { ...payload, requestId }, { timeoutMs: 25000 });
+    } catch (error) {
+      if (state.syncCancelled) throw new Error('用户中断同步');
+      if (attempt >= maxRetries || !isRetryableSyncError(error)) throw error;
+      const wait = Math.min(30000, 4000 * (2 ** attempt) + jitter(500, 1500));
+      onRetry?.(wait, attempt + 1, maxRetries, error);
+      if (!await waitForSyncDelay(wait)) throw new Error('用户中断同步');
+    } finally {
+      if (state.activeSyncRequestId === requestId) state.activeSyncRequestId = '';
+    }
+  }
 }
 
 async function slowSync() {
@@ -389,6 +494,7 @@ async function slowSync() {
   if (!mediaId) return msg('请先选择收藏夹。');
   if (state.syncing) {
     state.syncCancelled = true;
+    cancelActiveSyncRequest();
     msg('正在结束当前同步，已完成的分页会保留。');
     return;
   }
@@ -402,7 +508,7 @@ async function slowSync() {
   msg('开始慢速同步，期间不要连续点刷新。');
   const oldCache = await dbGet('items', mediaId);
   if (oldCache?.items?.length) {
-    state.items = oldCache.items;
+    replaceStateItems(oldCache.items);
     state.info = oldCache.info || null;
     resetRenderLimit();
     render();
@@ -411,7 +517,7 @@ async function slowSync() {
   const savedSync = oldCache?.partial && oldCache.syncState && Number(oldCache.syncState.nextPage) > 1
     ? oldCache.syncState
     : null;
-  const items = savedSync ? [...(oldCache.items || [])] : [];
+  let items = savedSync ? mergeUniqueItems([], oldCache.items || []) : [];
   let info = savedSync ? (oldCache.info || null) : null;
   let total = Number(savedSync?.total || info?.media_count || 0);
   let pages = Number(savedSync?.pages || (total ? Math.ceil(total / CACHE_PS) : 0));
@@ -424,39 +530,48 @@ async function slowSync() {
   try {
     for (let pn = nextPage; pages === 0 || pn <= pages; pn++) {
       if (state.syncCancelled) throw new Error('用户中断同步');
-      setProgress(items.length, total || 1, `正在请求第 ${pn} 页${pages ? ` / ${pages} 页` : ''}`);
-      const data = await send('GET_ITEMS_PAGE', { mediaId, pn, ps: CACHE_PS, order: 'mtime' });
+      setSyncProgress(Math.max(0, pn - 1), pages, items.length, total, `正在请求第 ${pn}${pages ? ` / ${pages}` : ''} 页`);
+      const data = await getSyncPageWithRetry(
+        { mediaId, pn, ps: CACHE_PS, order: 'mtime' },
+        (wait, retry, maxRetries, error) => setSyncProgress(
+          Math.max(0, pn - 1), pages, items.length, total,
+          `第 ${pn} 页请求失败（${error.message || '网络错误'}），${Math.round(wait / 1000)} 秒后重试 ${retry}/${maxRetries}`
+        )
+      );
       if (!info) {
         info = data.info || null;
         total = Number(info?.media_count || 0);
         pages = total > 0 ? Math.ceil(total / CACHE_PS) : 0;
       }
       const medias = (data.medias || []).filter(item => Number(item.type) === 2 || item.bvid || item.bv_id);
-      items.push(...medias);
+      items = mergeUniqueItems(items, medias);
       nextPage = pn + 1;
-      state.items = items;
+      replaceStateItems(items);
       state.info = info;
       await saveItemsCache(mediaId, items, info, true, {
         nextPage,
         total,
         pages,
         order: 'mtime',
-        ps: CACHE_PS
+        ps: CACHE_PS,
+        pagesDone: pn,
+        cachedCount: items.length
       });
       checkpointItems = [...items];
       checkpointNextPage = nextPage;
       render();
-      setProgress(items.length, total || items.length, `已同步 ${items.length} / ${total || items.length}，第 ${pn} / ${pages} 页`);
+      setSyncProgress(pn, pages, items.length, total, '同步进行中');
       if (state.syncCancelled) throw new Error('用户中断同步');
       const reachedExpectedPages = pages > 0 && pn >= pages;
       const apiReportedEnd = data.hasMore === false;
-      if (reachedExpectedPages || (pages === 0 && apiReportedEnd)) {
+      const emptyPage = (data.medias || []).length === 0;
+      if (reachedExpectedPages || (apiReportedEnd && (pages === 0 || emptyPage))) {
         completed = true;
         break;
       }
       const wait = jitter(1600, 3200);
-      setProgress(items.length, total || items.length, `等待 ${Math.round(wait / 1000)} 秒后继续，避免 412`);
-      await sleep(wait);
+      setSyncProgress(pn, pages, items.length, total, `等待 ${Math.round(wait / 1000)} 秒后继续，避免 412`);
+      if (!await waitForSyncDelay(wait)) throw new Error('用户中断同步');
     }
   } catch (e) {
     partial = !completed;
@@ -466,14 +581,20 @@ async function slowSync() {
         total,
         pages,
         order: 'mtime',
-        ps: CACHE_PS
+        ps: CACHE_PS,
+        pagesDone: Math.max(0, checkpointNextPage - 1),
+        cachedCount: checkpointItems.length
       });
-      state.items = checkpointItems;
+      replaceStateItems(checkpointItems);
       state.info = info;
       state.syncResumeAvailable = true;
       render();
       const cancelled = state.syncCancelled || e.message === '用户中断同步';
-      setProgress(checkpointItems.length, total || checkpointItems.length, `同步中断，已保存 ${checkpointItems.length} 个，可继续第 ${checkpointNextPage} 页`, cancelled ? false : true);
+      setSyncProgress(
+        Math.max(0, checkpointNextPage - 1), pages, checkpointItems.length, total,
+        cancelled ? '同步已中断' : '同步失败，已保存断点',
+        !cancelled
+      );
       msg(cancelled ? '同步已中断，已保存进度；再次点击“慢速同步”即可继续。' : (e.message || String(e)));
     } else {
       setProgress(0, 1, `同步失败：${e.message}`, true);
@@ -488,7 +609,7 @@ async function slowSync() {
   }
   if (partial) return;
   await saveItemsCache(mediaId, items, info, partial);
-  setProgress(items.length, total || items.length, `同步完成：${items.length} / ${total || items.length}`);
+  setSyncProgress(pages || Math.max(0, nextPage - 1), pages, items.length, total, '同步完成');
   msg(`已同步并缓存 ${items.length} 个视频。`);
 }
 
@@ -496,7 +617,7 @@ async function clearCurrentCache() {
   const mediaId = currentFolderId();
   if (!mediaId) return;
   await dbDelete('items', mediaId);
-  state.items = [];
+  replaceStateItems([]);
   state.info = null;
   state.syncResumeAvailable = false;
   els.syncBtn.textContent = '慢速同步';
@@ -514,9 +635,11 @@ function randomItemKey(item) {
 function resetRandomShuffle() {
   state.randomSortedItems = null;
   state.randomSortedSignature = '';
+  state.randomShuffleRevision += 1;
+  state.sortedCacheKey = '';
 }
 function shuffleItems(items) {
-  const signature = items.map(randomItemKey).join('\u0001');
+  const signature = `${state.itemsRevision}\u0002${items.map(randomItemKey).join('\u0001')}`;
   if (state.randomSortedItems && state.randomSortedSignature === signature) return state.randomSortedItems;
   const shuffled = [...items];
   for (let i = shuffled.length - 1; i > 0; i -= 1) {
@@ -549,17 +672,20 @@ function compareValues(a, b, dir) {
 function sortedItems() {
   const rules = [[els.sort1.value, els.dir1.value], [els.sort2.value, els.dir2.value], [els.sort3.value, els.dir3.value]].filter(([k]) => k && k !== 'none');
   const kw = textLike(els.keyword.value).trim();
+  const random = els.randomSort?.checked === true;
+  const cacheKey = JSON.stringify([state.itemsRevision, state.randomShuffleRevision, random, kw, rules]);
+  if (state.sortedCacheKey === cacheKey) return state.sortedCache;
   const filtered = [...state.items].filter(item => !kw || textLike(item.title).includes(kw) || textLike(item.upper?.name).includes(kw));
-  if (els.randomSort?.checked === true) {
-    return shuffleItems(filtered);
-  }
-  return filtered.sort((a, b) => {
+  const result = random ? shuffleItems(filtered) : filtered.sort((a, b) => {
       for (const [key, dir] of rules) {
         const r = compareValues(getValue(a, key), getValue(b, key), dir);
         if (r !== 0) return r;
       }
       return 0;
     });
+  state.sortedCache = result;
+  state.sortedCacheKey = cacheKey;
+  return result;
 }
 function fmtNum(n) {
   n = Number(n || 0);
@@ -684,9 +810,7 @@ function isEditableTarget(target) {
 }
 
 function currentSortedItems() {
-  if (Array.isArray(state.sortedCache) && state.sortedCache.length) return state.sortedCache;
-  state.sortedCache = sortedItems();
-  return state.sortedCache;
+  return sortedItems();
 }
 
 function renderedSelectedElement() {
@@ -911,10 +1035,10 @@ async function removeAidFromCache(aid, folderIds = [], createTrash = true) {
     const found = cache.items.find(v => Number(v.id || v.aid || v.rid) === Number(aid));
     const next = cache.items.filter(v => Number(v.id || v.aid || v.rid) !== Number(aid));
     if (found && createTrash) await storeTrash(found, folderId, 'page');
-    if (next.length !== cache.items.length) await saveItemsCache(folderId, next, cache.info, cache.partial);
+    if (next.length !== cache.items.length) await saveItemsCache(folderId, next, cache.info, cache.partial, cache.syncState);
   }
   if (ids.includes(currentFolderId())) {
-    state.items = state.items.filter(v => Number(v.id || v.aid) !== Number(aid));
+    replaceStateItems(state.items.filter(v => Number(v.id || v.aid) !== Number(aid)));
     render();
   }
 }
@@ -924,9 +1048,9 @@ async function addItemBackToCache(item, folderId) {
   const cache = await dbGet('items', folderId);
   const list = cache?.items ? [...cache.items] : [];
   if (!list.some(v => Number(v.id || v.aid || v.rid) === Number(item.id || item.aid || item.rid))) list.unshift(item);
-  await saveItemsCache(folderId, list, cache?.info || null, cache?.partial || false);
+  await saveItemsCache(folderId, list, cache?.info || null, cache?.partial || false, cache?.syncState || null);
   if (String(folderId) === currentFolderId()) {
-    if (!state.items.some(v => Number(v.id || v.aid || v.rid) === Number(item.id || item.aid || item.rid))) state.items.unshift(item);
+    if (!state.items.some(v => Number(v.id || v.aid || v.rid) === Number(item.id || item.aid || item.rid))) replaceStateItems([item, ...state.items]);
     render();
   }
 }
